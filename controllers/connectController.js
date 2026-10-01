@@ -1,0 +1,424 @@
+const ConnectLog = require('../models/ConnectLog');
+const User = require('../models/User');
+const PhoneReveal = require('../models/PhoneReveal');
+const CreditTransaction = require('../models/CreditTransaction');
+
+// A connection is available whenever the account has at least 1 connect/credit.
+// An active package is not required when the account already has connectsBalance.
+const activePackageFilter = (userId, types) => ({
+    _id: userId,
+    connectsBalance: { $gt: 0 },
+    $or: [
+        { "activePackage.validTill": { $exists: false } },
+        { "activePackage.validTill": { $gt: new Date() } }
+    ]
+});
+
+const isActivePackage = (user) => {
+    const validTill = user?.activePackage?.validTill;
+    return !validTill || new Date(validTill).getTime() > Date.now();
+};
+
+// Some older package records have the package credit count in
+// activePackage.creditsRemaining while connectsBalance is zero. Treat the
+// larger available balance as the authoritative spendable connect count.
+const getAvailableConnects = (user) => {
+    if (!user) return 0;
+    const wallet = Number(user.connectsBalance || 0);
+    const packageRemaining = isActivePackage(user)
+        ? Number(user.activePackage?.creditsRemaining || 0)
+        : 0;
+    return Math.max(wallet, packageRemaining);
+};
+
+const chargeOneConnect = async (userId) => {
+    let user = await User.findById(userId);
+    if (!user) return null;
+
+    const wallet = Number(user.connectsBalance || 0);
+    const packageRemaining = isActivePackage(user)
+        ? Number(user.activePackage?.creditsRemaining || 0)
+        : 0;
+
+    if (wallet <= 0 && packageRemaining <= 0) return null;
+
+    if (wallet > 0) {
+        user.connectsBalance = wallet - 1;
+    }
+
+    if (packageRemaining > 0) {
+        user.activePackage.creditsRemaining = Math.max(0, packageRemaining - 1);
+        user.activePackage.usedCredits = Number(user.activePackage.usedCredits || 0) + 1;
+    }
+
+    user.creditsUsed = Number(user.creditsUsed || 0) + 1;
+    await user.save();
+
+    return user;
+};
+
+const getConnectionPayer = async (viewerId, ownerId) => {
+    const [viewer, owner] = await Promise.all([
+        User.findById(viewerId),
+        User.findById(ownerId)
+    ]);
+
+    if (!viewer || !owner) return { user: null, payerType: null };
+
+    // A Both package pays for people connecting to the owner's approved posts.
+    // This means the visitor does not need a credit when the post owner has
+    // an active Both package with available credit.
+    if (
+        owner._id.toString() !== viewer._id.toString() &&
+        owner.activePackage?.type === "Both" &&
+        isActivePackage(owner)
+    ) {
+        return { user: owner, payerType: "owner" };
+    }
+
+    return { user: viewer, payerType: "viewer" };
+};
+
+// For a valid Both package, the post owner controls access for every visitor.
+// If owner credits remain, one is consumed. If the wallet reaches zero, the
+// Both package still authorizes the connection until its validTill date.
+const consumeConnectionForPayer = async (payer) => {
+    if (!payer?.user) return { user: null, charged: false };
+    if (getAvailableConnects(payer.user) > 0) {
+        const charged = await chargeOneConnect(payer.user._id);
+        if (charged) return { user: charged, charged: true };
+    }
+
+    if (payer.payerType === "owner" && isActivePackage(payer.user) && payer.user.activePackage?.type === "Both") {
+        return { user: payer.user, charged: false };
+    }
+
+    return { user: null, charged: false };
+};
+
+exports.deductConnect = async (req, res) => {
+    try {
+        const { actionType, amountSpent, targetUserId } = req.body;
+        const userId = req.user.id;
+        const validActionTypes = ['call', 'message', 'proposal', 'post_ad', 'view_phone'];
+        const requiresTargetUser = ['call', 'message', 'proposal', 'view_phone'].includes(actionType);
+        if (!validActionTypes.includes(actionType)) return res.status(400).json({ success:false, message:'Unsupported connect action type.' });
+        if (requiresTargetUser && !targetUserId) return res.status(400).json({ success:false, message:'A valid target user is required for this action.' });
+        if (actionType === 'post_ad' && targetUserId) return res.status(400).json({ success:false, message:'Post creation cannot include a target user.' });
+        const amount = Number(amountSpent);
+        if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success:false, message:'Amount spent must be positive.' });
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ success:false, message:'User not found' });
+        if (Number(user.connectsBalance || 0) < amount) return res.status(400).json({ success:false, message:'Insufficient connects balance' });
+        const before = Number(user.connectsBalance || 0);
+        user.connectsBalance = before - amount;
+        await user.save();
+        await ConnectLog.create({ userId, actionType, amountSpent:amount, targetUserId:requiresTargetUser ? targetUserId : undefined });
+        res.json({ success:true, message:'Connect deducted successfully', balance:user.connectsBalance });
+    } catch (err) { res.status(500).json({ success:false, message:err.message }); }
+};
+
+exports.revealPhone = async (req, res) => {
+    try {
+        const { adId } = req.body;
+        const Ad = require('../models/Ad');
+        const ad = await Ad.findById(adId).select('phone user hidePhone status');
+        if (!ad) return res.status(404).json({ success:false, message:'Post not found' });
+        if (ad.status !== 'active') return res.status(409).json({ success:false, message:'This post is not approved yet.' });
+        if (!ad.phone) return res.status(404).json({ success:false, message:'This post has no phone number.' });
+        const viewerId = String(req.user.id);
+        const ownerId = String(ad.user);
+        if (viewerId === ownerId) return res.json({ success:true, phone:ad.phone, balance:null, ownNumber:true });
+
+        let reveal;
+        try {
+            reveal = await PhoneReveal.findOneAndUpdate(
+                { viewerId, adId, status:{ $in:['PENDING','OPEN'] } },
+                { $setOnInsert:{ viewerId, profileOwnerId:ad.user, adId, status:'PENDING' } },
+                { new:true, upsert:true }
+            );
+        } catch (error) {
+            if (error?.code !== 11000) throw error;
+            reveal = await PhoneReveal.findOne({ viewerId, adId, status:{ $in:['PENDING','OPEN'] } });
+        }
+        if (reveal?.status === 'OPEN') return res.json({ success:true, phone:ad.phone, balance:null, revealId:reveal._id, alreadyRevealed:true });
+
+        const claimedReveal = await PhoneReveal.findOneAndUpdate(
+            { _id:reveal._id, status:'PENDING', chargingStartedAt:{ $exists:false } },
+            { $set:{ chargingStartedAt:new Date() } },
+            { new:true }
+        );
+        if (!claimedReveal) {
+            // Another request is already charging/opening this exact reveal.
+            // Wait briefly for that request to finish instead of surfacing a
+            // concurrent-request error to the viewer.
+            for (let attempt = 0; attempt < 20; attempt += 1) {
+                const completed = await PhoneReveal.findById(reveal._id).select("status _id");
+                if (completed?.status === "OPEN") {
+                    return res.json({
+                        success:true,
+                        phone:ad.phone,
+                        balance:null,
+                        revealId:completed._id,
+                        alreadyRevealed:true
+                    });
+                }
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+            return res.status(409).json({
+                success:false,
+                code:"REVEAL_IN_PROGRESS",
+                message:"Your number reveal is already being processed. Please try again."
+            });
+        }
+
+        // Both-package accounts own the connection cost for their approved
+        // posts. If wallet credits remain, one is consumed; once the wallet
+        // reaches zero, the valid Both package still authorizes the reveal
+        // until validTill.
+        const payer = await getConnectionPayer(viewerId, ownerId);
+        const chargeResult = await consumeConnectionForPayer(payer);
+        const chargedUser = chargeResult.user;
+        if (!chargedUser) {
+            await PhoneReveal.deleteOne({ _id:reveal._id, status:'PENDING' });
+            return res.status(403).json({ success:false, code:'PACKAGE_REQUIRED', message:'Purchase an active package to view this number.' });
+        }
+
+        const balanceBefore = chargeResult.charged
+            ? Number(chargedUser.connectsBalance) + 1
+            : Number(chargedUser.connectsBalance);
+
+        if (chargeResult.charged) {
+            claimedReveal.chargedUserId = chargedUser._id;
+            claimedReveal.packageId = chargedUser.activePackage?.packageId;
+        } else if (payer.payerType === 'owner') {
+            claimedReveal.packageId = chargedUser.activePackage?.packageId;
+        }
+
+        claimedReveal.status = 'OPEN';
+        claimedReveal.openedAt = new Date();
+        await claimedReveal.save();
+
+        const socketio = req.app.get('socketio');
+        if (socketio && chargeResult.charged) {
+            const payload = {
+                userId: String(chargedUser._id),
+                balance: getAvailableConnects(chargedUser),
+                connectsBalance: getAvailableConnects(chargedUser),
+                creditsUsed: chargedUser.creditsUsed,
+                activePackage: chargedUser.activePackage
+            };
+            socketio.to(String(chargedUser._id)).emit('credit balance updated', payload);
+            socketio.to(String(chargedUser._id)).emit('package updated', {
+                ...payload,
+                validityDate: chargedUser.validityDate
+            });
+        }
+
+        const phoneAudit = [
+            User.updateOne({ _id:ad.user }, { $inc:{ numberShowupCount:1 } })
+        ];
+
+        if (chargeResult.charged) {
+            phoneAudit.push(
+                ConnectLog.create({
+                    userId:chargedUser._id,
+                    actionType:'view_phone',
+                    amountSpent:1,
+                    targetUserId:ad.user
+                }),
+                CreditTransaction.create({
+                    userId:chargedUser._id,
+                    type:'REVEAL',
+                    amount:-1,
+                    balanceBefore,
+                    balanceAfter:chargedUser.connectsBalance,
+                    source:'PHONE_REVEAL',
+                    targetUserId:ad.user,
+                    postId:ad._id,
+                    packageId:chargedUser.activePackage?.packageId,
+                    phoneRevealId:claimedReveal._id,
+                    reason:payer.payerType === 'owner'
+                        ? 'Phone number revealed - charged to post owner Both package'
+                        : 'Phone number revealed'
+                })
+            );
+        }
+
+        await Promise.all(phoneAudit);
+        res.json({
+            success:true,
+            phone:ad.phone,
+            balance:getAvailableConnects(chargedUser),
+            revealId:claimedReveal._id,
+            payerType: payer.payerType
+        });
+    } catch (err) { res.status(500).json({ success:false, message:err.message }); }
+};
+
+exports.closePhoneReveal = async (req, res) => {
+    try {
+        const reveal = await PhoneReveal.findOne({ _id:req.params.id, viewerId:req.user.id, status:'OPEN' });
+        if (!reveal) return res.json({ success:true, refunded:false });
+        const chargedUser = await User.findById(reveal.chargedUserId).select('activePackage connectsBalance');
+        const refundable = Boolean(chargedUser?.activePackage?.returnCreditOnClose);
+        if (refundable && reveal.chargedUserId) {
+            const updated = await User.findOneAndUpdate(
+                { _id:reveal.chargedUserId, 'activePackage.packageId':reveal.packageId },
+                { $inc:{ 'activePackage.creditsRemaining':1, 'activePackage.usedCredits':-1, connectsBalance:1, creditsUsed:-1, creditsRefunded:1 } },
+                { new:true }
+            );
+            if (updated) {
+                await CreditTransaction.create({
+                    userId:updated._id, type:'REFUND', amount:1,
+                    balanceBefore:Number(updated.activePackage.creditsRemaining)-1,
+                    balanceAfter:updated.activePackage.creditsRemaining,
+                    source:'PHONE_REVEAL_CLOSE', targetUserId:reveal.profileOwnerId,
+                    postId:reveal.adId, packageId:reveal.packageId,
+                    reason:'Refunded under package close-number policy'
+                });
+                await User.updateOne({ _id:reveal.profileOwnerId }, { $inc:{ numberShowupCount:-1 } });
+            }
+        }
+        reveal.status = refundable ? 'REFUNDED' : 'CLOSED';
+        if (refundable) reveal.refundedAt = new Date();
+        await reveal.save();
+        res.json({ success:true, refunded:refundable });
+    } catch (err) { res.status(500).json({ success:false, message:err.message }); }
+};
+
+exports.getConnectLogs = async (req,res) => {
+    try {
+        const filter = req.query.userId ? { userId:req.query.userId } : { userId:req.user.id };
+        const logs = await ConnectLog.find(filter).populate('userId','name email mobile').populate('targetUserId','name email mobile').sort({createdAt:-1});
+        res.json({success:true,data:logs});
+    } catch(err){res.status(500).json({success:false,message:err.message});}
+};
+
+exports.getCreditTransactions = async (req,res) => {
+    try {
+        const transactions = await CreditTransaction.find({userId:req.user.id}).populate('targetUserId','name mobile').populate('postId','headline').sort({createdAt:-1}).limit(100).lean();
+        res.json({success:true,data:transactions});
+    } catch(err){res.status(500).json({success:false,message:'Unable to load credit history.'});}
+};
+
+exports.unlockPost = async (req, res) => {
+    try {
+        const { adId, actionType = 'message' } = req.body;
+        const userId = String(req.user.id);
+        if (!adId) return res.status(400).json({ success:false, message:'Post ID is required.' });
+        if (!['message','proposal'].includes(actionType)) {
+            return res.status(400).json({ success:false, message:'Invalid connection action.' });
+        }
+
+        const Ad = require('../models/Ad');
+        const ad = await Ad.findById(adId).select('user phone status');
+        if (!ad) return res.status(404).json({ success:false, message:'Post not found.' });
+        if (ad.status !== 'active') return res.status(409).json({ success:false, message:'This post is not approved yet.' });
+        if (String(ad.user) === userId) return res.json({ success:true, unlocked:true, ownPost:true });
+
+        const existing = await PhoneReveal.findOne({
+            viewerId:userId,
+            adId,
+            status:{ $in:['PENDING','OPEN'] }
+        });
+        if (existing?.status === 'OPEN') {
+            return res.json({ success:true, unlocked:true, alreadyUnlocked:true, revealId:existing._id });
+        }
+
+        const reveal = existing || await PhoneReveal.create({
+            viewerId:userId,
+            profileOwnerId:ad.user,
+            adId,
+            status:'PENDING'
+        });
+
+        const claimed = await PhoneReveal.findOneAndUpdate(
+            { _id:reveal._id, status:'PENDING', chargingStartedAt:{ $exists:false } },
+            { $set:{ chargingStartedAt:new Date(), connectMethod:actionType } },
+            { new:true }
+        );
+        if (!claimed) {
+            // A phone reveal/chat/CV request can arrive at the same time.
+            // Wait for the first connection transaction to finish instead
+            // of returning a transient "already being processed" error.
+            for (let attempt = 0; attempt < 20; attempt += 1) {
+                const completed = await PhoneReveal.findById(reveal._id).select("status _id");
+                if (completed?.status === "OPEN") {
+                    return res.json({
+                        success:true,
+                        unlocked:true,
+                        alreadyUnlocked:true,
+                        revealId:completed._id
+                    });
+                }
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+            return res.status(409).json({
+                success:false,
+                message:"Connection is already being processed. Please try again."
+            });
+        }
+
+        const payer = await getConnectionPayer(userId, ad.user);
+        const chargeResult = await consumeConnectionForPayer(payer);
+        const chargedUser = chargeResult.user;
+
+        if (!chargedUser) {
+            await PhoneReveal.deleteOne({ _id:reveal._id, status:'PENDING' });
+            return res.status(403).json({
+                success:false,
+                code:'PACKAGE_REQUIRED',
+                message:'Purchase an active package to connect with this post.'
+            });
+        }
+
+        const balanceBefore = Number(chargedUser.connectsBalance) + 1;
+        if (chargeResult.charged) {
+            claimed.chargedUserId = chargedUser._id;
+            claimed.packageId = chargedUser.activePackage?.packageId;
+        } else if (payer.payerType === "owner") {
+            claimed.packageId = chargedUser.activePackage?.packageId;
+        }
+        claimed.connectMethod = actionType;
+        claimed.status = 'OPEN';
+        claimed.openedAt = new Date();
+        await claimed.save();
+
+        const socketio = req.app.get('socketio');
+        if (socketio) {
+            socketio.to(String(chargedUser._id)).emit('credit balance updated', {
+                userId: String(chargedUser._id),
+                balance: getAvailableConnects(chargedUser),
+                connectsBalance: getAvailableConnects(chargedUser),
+                creditsUsed: chargedUser.creditsUsed
+            });
+        }
+
+        if (chargeResult.charged) {
+            await Promise.all([
+                ConnectLog.create({ userId:chargedUser._id, actionType, amountSpent:1, targetUserId:ad.user }),
+                CreditTransaction.create({
+                    userId:chargedUser._id,
+                    type:'REVEAL',
+                    amount:-1,
+                    balanceBefore,
+                    balanceAfter:chargedUser.connectsBalance,
+                    source:'POST_CONNECTION',
+                    targetUserId:ad.user,
+                    postId:ad._id,
+                    packageId:chargedUser.activePackage?.packageId,
+                    phoneRevealId:claimed._id,
+                    reason:payer.payerType === 'owner'
+                        ? 'First connection unlocked for post - charged to post owner Both package'
+                        : 'First connection unlocked for post'
+                })
+            ]);
+        }
+
+        res.json({ success:true, unlocked:true, balance:getAvailableConnects(chargedUser), revealId:claimed._id });
+    } catch (err) {
+        console.error('unlockPost error:', err);
+        res.status(500).json({ success:false, message:err.message });
+    }
+};

@@ -1,0 +1,3 @@
+const mongoose = require('mongoose');
+const PackageSchema = new mongoose.Schema({name:{type:String,required:true},packageType:{type:String,enum:['You','Both'],default:'You'},oldPrice:{type:Number,default:0},price:{type:Number,required:true},total_connects:{type:Number,required:true},maxProfileView:{type:Number,default:0},validDays:{type:Number,default:30},bestValueSuggestion:{type:Boolean,default:false},checkedFeatures:{type:[String],default:[]},uncheckedFeatures:{type:[String],default:[]},isActive:{type:Boolean,default:true}},{timestamps:true});
+module.exports=mongoose.model('Package',PackageSchema);

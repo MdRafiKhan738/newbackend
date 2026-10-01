@@ -35,7 +35,12 @@ process.on('unhandledRejection', (reason, promise) => {
 // check git and render
 // Initialize Express app
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin: [
+        "https://newshadamon.vercel.app",
+        "https://newadmin.vercel.app"
+    ]
+}));
 const server = require('http').createServer(app);
 const io = new (require('socket.io').Server)(server, {
     cors: {
